@@ -781,6 +781,13 @@ extern "C" auto gvox_parse_adapter_magicavoxel_sample_region(GvoxBlitContext *bl
             voxel_data = 0;
         }
         break;
+    case GVOX_CHANNEL_ID_MATERIAL_TYPE:
+        if (palette_id < 255) {
+            voxel_data = static_cast<uint32_t>(user_state.materials[palette_id].type);
+        } else {
+            voxel_data = 0;
+        }
+        break;
     default:
         gvox_adapter_push_error(ctx, GVOX_RESULT_ERROR_PARSE_ADAPTER_REQUESTED_CHANNEL_NOT_PRESENT, "Requested unsupported channel from magicavoxel file");
         break;
