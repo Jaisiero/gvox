@@ -9,6 +9,7 @@
 #include <fstream>
 #include <vector>
 #include <cstdint>
+#include <stack>
 
 #define HANDLE_RES(x, message)               \
     if ((x) != GVOX_SUCCESS) {               \
@@ -100,6 +101,26 @@ auto main() -> int {
         gvox_create_iterator(&iter_ci, &input_iterator);
     }
 
+    struct NodeContext {
+        enum Type { UNKNOWN, ANIMATION, MODEL };
+        Type type;
+        uint32_t animation_id;
+        uint32_t current_frame;
+    };
+
+    struct ModelData {
+        uint32_t num_voxels;
+        uint32_t animation_id;
+        uint32_t frame_index;
+    };
+    
+    std::stack<NodeContext> context_stack;
+    std::vector<ModelData> models;
+    uint32_t current_animation_id = 0;
+    uint32_t current_model_index = 0;
+    bool in_model = false;
+    ModelData* current_model = nullptr;
+
     // Now we'll simply iterate over the input.
     auto iter_value = GvoxIteratorValue{};
     auto advance_info = GvoxIteratorAdvanceInfo{
@@ -108,22 +129,130 @@ auto main() -> int {
     };
     while (true) {
         gvox_iterator_advance(input_iterator, &advance_info, &iter_value);
-        if (iter_value.tag == GVOX_ITERATOR_VALUE_TYPE_NULL) {
-            break;
-        }
-        if (iter_value.tag == GVOX_ITERATOR_VALUE_TYPE_LEAF) {
-            // And for every "Leaf" node in the model, we'll write it into our container.
-            auto fill_info = GvoxFillInfo{
-                .struct_type = GVOX_STRUCT_TYPE_FILL_INFO,
-                .next = nullptr,
-                .src_data = iter_value.voxel_data,
-                .src_desc = iter_value.voxel_desc,
-                .dst = raw_container,
-                .range = iter_value.range,
-            };
-            HANDLE_RES(gvox_fill(&fill_info), "Failed to do fill");
+        switch (iter_value.tag) {case GVOX_ITERATOR_VALUE_TYPE_NODE_BEGIN: {
+                NodeContext new_context{};
+                
+                if (iter_value.flags & GVOX_NODE_FLAG_ANIMATION) {
+                    // This is an animation
+                    new_context.type = NodeContext::ANIMATION;
+                    new_context.animation_id = current_animation_id++;
+                    new_context.current_frame = 0;
+                    
+                    std::cout << "ANIMATION BEGIN: ID=" << new_context.animation_id << std::endl;
+                    
+                } else {
+                    // This is a model
+                    new_context.type = NodeContext::MODEL;
+                    
+                    // Check if we're inside an animation
+                    bool inside_animation = false;
+                    uint32_t parent_animation_id = UINT32_MAX;
+                    uint32_t frame_index = 0;
+                    
+                    if (!context_stack.empty() && context_stack.top().type == NodeContext::ANIMATION) {
+                        inside_animation = true;
+                        parent_animation_id = context_stack.top().animation_id;
+                        frame_index = context_stack.top().current_frame++;
+                    }
+                    
+                    // Create new model
+                    models.emplace_back();
+                    current_model = &models.back();
+                    current_model->num_voxels = 0;
+                    current_model->animation_id = parent_animation_id;
+                    current_model->frame_index = frame_index;
+                    
+                    if (inside_animation) {
+                        std::cout << "  MODEL BEGIN: ID=" << current_model_index 
+                                  << " (Animation " << parent_animation_id 
+                                  << ", Frame " << frame_index << ")" << std::endl;
+                    } else {
+                        std::cout << "MODEL BEGIN: ID=" << current_model_index << " (Standalone)" << std::endl;
+                    }
+                    
+                    current_model_index++;
+                    in_model = true;
+                }
+                
+                context_stack.push(new_context);
+                
+            } break;
+            case GVOX_ITERATOR_VALUE_TYPE_NODE_END: {
+                if (!context_stack.empty()) {
+                    auto context = context_stack.top();
+                    context_stack.pop();
+                    
+                    if (context.type == NodeContext::ANIMATION) {
+                        std::cout << "ANIMATION END: ID=" << context.animation_id 
+                                  << " (" << context.current_frame << " frames)" << std::endl;
+                    } else if (context.type == NodeContext::MODEL) {
+                        if (current_model) {
+                            if (current_model->animation_id != UINT32_MAX) {
+                                std::cout << "  MODEL END: " << current_model->num_voxels 
+                                          << " voxels (Animation " << current_model->animation_id 
+                                          << ", Frame " << current_model->frame_index << ")" << std::endl;
+                            } else {
+                                std::cout << "MODEL END: " << current_model->num_voxels 
+                                          << " voxels (Standalone)" << std::endl;
+                            }
+                        }
+                        current_model = nullptr;
+                        in_model = false;
+                    }
+                }
+            }   break;
+            case GVOX_ITERATOR_VALUE_TYPE_LEAF: {
+                if (in_model && current_model) {
+                    current_model->num_voxels++;
+                }
+                // And for every "Leaf" node in the model, we'll write it into our container.
+                auto fill_info = GvoxFillInfo{
+                    .struct_type = GVOX_STRUCT_TYPE_FILL_INFO,
+                    .next = nullptr,
+                    .src_data = iter_value.voxel_data,
+                    .src_desc = iter_value.voxel_desc,
+                    .dst = raw_container,
+                    .range = iter_value.range,
+                };
+                HANDLE_RES(gvox_fill(&fill_info), "Failed to do fill");
+            } break;
+            case GVOX_ITERATOR_VALUE_TYPE_NULL:{
+                goto end_iteration;
+            }
+            default:
+                break;
         }
     }
+
+    // a little gift
+end_iteration:
+    std::cout << "\n=== SUMMARY ===" << std::endl;
+    std::cout << "Total models: " << models.size() << std::endl;
+    
+    uint32_t total_voxels = 0;
+    uint32_t animation_frames = 0;
+    uint32_t standalone_models = 0;
+    
+    for (size_t i = 0; i < models.size(); ++i) {
+        const auto& model = models[i];
+        total_voxels += model.num_voxels;
+        
+        std::cout << "Model " << i << ": " << model.num_voxels << " voxels";
+        
+        if (model.animation_id != UINT32_MAX) {
+            std::cout << " (Animation " << model.animation_id 
+                      << ", Frame " << model.frame_index << ")";
+            animation_frames++;
+        } else {
+            std::cout << " (Standalone)";
+            standalone_models++;
+        }
+        std::cout << std::endl;
+    }
+    
+    std::cout << "Animation frames: " << animation_frames << std::endl;
+    std::cout << "Standalone models: " << standalone_models << std::endl;
+    std::cout << "Total voxels: " << total_voxels << std::endl;
 
     gvox_destroy_iterator(input_iterator);
     gvox_destroy_input_stream(file_input);
